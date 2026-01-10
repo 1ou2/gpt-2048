@@ -40,7 +40,7 @@ All helper functions should be inside def strategy. Only output the short functi
 
 ### Reward Functions
 
-Three reward functions guide the learning process (evaluated in sequence):
+Three reward functions guide the learning process (evaluated in sequence). The rewards are designed to be **balanced** so no single reward dominates, and to create **variance** which GRPO requires to learn.
 
 #### 1. `function_works()`
 - **+1.0**: Valid Python syntax that can be executed
@@ -54,12 +54,39 @@ Three reward functions guide the learning process (evaluated in sequence):
 
 #### 3. `strategy_succeeds()`
 - **+20.0**: Strategy reaches 2048 tile (success!)
-- **+2.0**: Strategy runs but doesn't reach 2048
-- **-1.0**: Strategy times out (>5 seconds)
-- **-3.0**: Strategy crashes with exception
-- **0.0**: Invalid function
+- **Tile-based**: Reward = `log2(max_tile) - 2` for tiles ≥ 8
+- **-3.0**: Invalid move returned (not W/A/S/D) - **critical to prevent garbage output**
+- **-2.0**: Function crashes, infinite loops, or forbidden modules
+- **-1.0**: Strategy times out (>2 seconds) or extraction failed
 
-**Total possible reward range:** -25.0 (worst) to +22.0 (best)
+**Why tile-based rewards?** Score-based rewards allowed simple `return "W"` strategies to score well (340+ points) by making many small merges. Tile-based rewards fix this because single-direction strategies cap at ~16-32, while smarter strategies can reach 64, 128, 256+.
+
+**Tile-based reward examples:**
+| Max Tile | Level | Reward |
+|----------|-------|--------|
+| < 8 | - | 0.0 |
+| 8 | 1 | 1.0 |
+| 16 | 2 | 2.0 |
+| 32 | 3 | 3.0 |
+| 64 | 4 | 4.0 |
+| 128 | 5 | 5.0 |
+| 256 | 6 | 6.0 |
+| 512 | 7 | 7.0 |
+
+**Total reward examples:**
+| Scenario | function_works | no_cheating | strategy_succeeds | **Total** |
+|----------|----------------|-------------|-------------------|-----------|
+| Syntax error | -2.0 | - | - | **-2.0** |
+| Cheating code | +1.0 | -20.0 | - | **-19.0** |
+| Garbage `return "{"` | +1.0 | +1.0 | -3.0 | **-1.0** |
+| `return "W"` (max 16) | +1.0 | +1.0 | 2.0 | **+4.0** |
+| Reaches 32 | +1.0 | +1.0 | 3.0 | **+5.0** |
+| Reaches 64 | +1.0 | +1.0 | 4.0 | **+6.0** |
+| Reaches 128 | +1.0 | +1.0 | 5.0 | **+7.0** |
+| Reaches 256 | +1.0 | +1.0 | 6.0 | **+8.0** |
+| Wins (2048) | +1.0 | +1.0 | 20.0 | **+22.0** |
+
+**Why this breaks the local minimum:** Simple `return "W"` strategies get stuck at max tile 16-32 (reward 2-3), while strategies that intelligently combine moves can reach 64+ (reward 4+). This creates a clear gradient for learning better strategies.
 
 ### Training Process
 
@@ -98,19 +125,28 @@ Each training step (takes ~85-90 seconds):
 Watch these key metrics in the logs:
 
 **Critical metrics:**
-- `reward`: Total reward (target: increasing from -3.0 toward +4.0)
-- `rewards/strategy_succeeds/mean`: Game performance (target: 2.0+)
-- `reward_std`: Variance in rewards (must be >0 for GRPO to learn)
+- `reward`: Total reward (target: increasing from +2.0 toward +7.0)
+- `reward_std`: Variance in rewards (**CRITICAL**: must be >0 for GRPO to learn)
+- `rewards/strategy_succeeds/mean`: Game performance (target: increasing over time)
 
 **Quality indicators:**
-- `completions/clipped_ratio`: If 1.0, outputs hit 200-token limit (expected)
-- `kl`: KL divergence (<0.01 is safe, >0.05 risks mode collapse)
+- `completions/clipped_ratio`: If 1.0, outputs hit token limit (should decrease over time)
+- `kl`: KL divergence (<0.1 is safe, >0.3 risks mode collapse)
 - `frac_reward_zero_std`: Fraction of batches with no variance (target: <0.5)
 
+**Warning signs of model collapse:**
+- `reward_std: 0.0` - No variance, GRPO cannot learn
+- `frac_reward_zero_std: 1.0` - All batches have identical rewards
+- `completions/mean_length: 14` - Model only outputs `return 'W'`
+- `clipped_ratio: 1.0` with garbage output - Model outputs `return "{"`, `return "<"` etc.
+- `kl > 0.4` - Model diverged too far from base
+
+If you see these signs, the model has found a local optimum. Check if invalid moves are being penalized (should get negative rewards). Restart training from scratch or an earlier checkpoint.
+
 **What you'll see:**
-- First 50-100 steps: Timeouts, "return W" copies, negative rewards
-- Steps 100-200: Some variance appears, occasional valid strategies
-- Steps 200+: Rewards improve, strategies attempt actual gameplay
+- First 50-100 steps: Timeouts, simple strategies, low scores
+- Steps 100-300: Variance appears, some strategies score 100-500
+- Steps 300+: Better strategies emerge, scores increase toward 1000+
 
 **According to the tutorial:** "You might have to wait 150 to 200 steps for any action. You'll probably get 0 reward for the first 100 steps. Please be patient!"
 

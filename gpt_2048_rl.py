@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Callable
 import random
 import copy
+import math
 import numpy as np
 from unsloth import FastLanguageModel, execute_with_time_limit, check_python_modules, create_locked_down_function
 import torch
@@ -395,9 +396,9 @@ def strategy_succeeds(completions, **kwargs):
         # Extract function
         function = extract_function(response)
         if function is None:
-            if PRINTER % 5 == 1:  # Print if we just printed the full completion
+            if PRINTER % 5 == 1:
                 print("❌ Failed to extract function from response")
-            scores.append(0)
+            scores.append(-1.0)  # Penalize extraction failure
             continue
 
         # Block dangerous functions that can hang (input, open, etc.)
@@ -405,7 +406,7 @@ def strategy_succeeds(completions, **kwargs):
         if any(call in function for call in dangerous_calls):
             if PRINTER % 5 == 1:
                 print(f"❌ Dangerous function call detected")
-            scores.append(0)
+            scores.append(-2.0)  # Penalize dangerous calls
             continue
 
         # Block potential infinite loops
@@ -413,7 +414,7 @@ def strategy_succeeds(completions, **kwargs):
         if any(pattern in function for pattern in infinite_loop_patterns):
             if PRINTER % 5 == 1:
                 print(f"❌ Potential infinite loop detected")
-            scores.append(0)
+            scores.append(-2.0)  # Penalize infinite loops
             continue
 
         # Check for forbidden modules
@@ -421,7 +422,7 @@ def strategy_succeeds(completions, **kwargs):
         if "error" in info:
             if PRINTER % 5 == 1:
                 print(f"❌ Forbidden modules detected: {info}")
-            scores.append(0)
+            scores.append(-2.0)  # Penalize forbidden modules
             continue
 
         # Try to create executable function
@@ -430,20 +431,27 @@ def strategy_succeeds(completions, **kwargs):
         except Exception as e:
             if PRINTER % 5 == 1:
                 print(f"❌ Failed to create function: {str(e)}")
-            scores.append(0)
+            scores.append(-1.0)  # Penalize function creation failure
             continue
-        # TEST: Function must return valid move
+
+        # TEST: Function must return valid move (W/A/S/D)
         test_board = [[0]*6 for _ in range(6)]
         try:
             test_move = new_strategy(test_board)
             if not isinstance(test_move, str):
-                scores.append(0)
+                if PRINTER % 5 == 1:
+                    print(f"❌ Invalid return type: {type(test_move)}")
+                scores.append(-3.0)  # Penalize non-string return
                 continue
             if test_move not in ["W", "A", "S", "D"]:
-                scores.append(0)
+                if PRINTER % 5 == 1:
+                    print(f"❌ Invalid move: '{test_move}' (must be W/A/S/D)")
+                scores.append(-3.0)  # Penalize invalid moves HEAVILY
                 continue
         except Exception as e:
-            scores.append(0)
+            if PRINTER % 5 == 1:
+                print(f"❌ Function crashed on test: {str(e)}")
+            scores.append(-2.0)  # Penalize crashes
             continue
 
         # Execute strategy on game
@@ -457,15 +465,96 @@ def strategy_succeeds(completions, **kwargs):
 
             if game_state == "success":
                 print("🎉 SUCCESS! Reached 2048!")
-                scores.append(20.0)  # Success - massively reward!
+                scores.append(20.0)  # Success - massive reward!
             else:
-                scores.append(2.0)  # Failed but function works!
+                # Reward based on highest tile achieved (not score)
+                # This breaks the "return W" local minimum because:
+                # - Simple single-direction strategies cap at ~16-32
+                # - Smarter strategies can reach 64, 128, 256+
+                # Level: 8->1, 16->2, 32->3, 64->4, 128->5, 256->6, 512->7
+                max_tile = max(max(row) for row in game.board())
+                if max_tile >= 8:
+                    level = int(math.log2(max_tile)) - 2
+                    tile_reward = float(level)
+                    print(f"🎯 Max tile: {max_tile} -> reward: {tile_reward}")
+                    scores.append(tile_reward)
+                else:
+                    scores.append(0.0)
         except TimeoutError as e:
-            print("⏱️  Timeout (5s exceeded)")
-            scores.append(-1.0)  # Failed with timeout
+            print("⏱️  Timeout (2s exceeded)")
+            scores.append(-1.0)  # Timeout penalty
         except Exception as e:
             print(f"💥 Exception: {str(e)}")
-            scores.append(-3.0)  # Failed
+            scores.append(-3.0)  # Crash penalty
+
+    return scores
+
+
+def complexity_reward(completions, **kwargs):
+    """
+    Reward function to prevent collapse to trivially simple strategies.
+
+    This addresses the recurring issue where GRPO collapses to `return "A"` or similar
+    single-line strategies. Without this, simple strategies achieve +4.0 reward
+    (function_works + no_cheating + valid move) which is a local optimum.
+
+    Rewards:
+    - Length: Penalize < 50 tokens, bonus for 50-200 tokens
+    - Complexity: Bonus for conditionals (if/for/while with logic)
+    - Diversity: Bonus for using multiple move directions
+    """
+    scores = []
+
+    for completion in completions:
+        response = completion[0]["content"]
+        function = extract_function(response)
+
+        if function is None:
+            scores.append(0.0)  # Neutral - other functions handle this
+            continue
+
+        reward = 0.0
+
+        # 1. LENGTH PENALTY/BONUS
+        # `return "A"` is ~14 tokens, we want to discourage this
+        func_len = len(function)
+        if func_len < 30:  # Very short (e.g., `return "A"`)
+            reward -= 3.0  # Strong penalty
+        elif func_len < 80:  # Short but has some logic
+            reward -= 1.0  # Mild penalty
+        elif func_len < 300:  # Good length with logic
+            reward += 1.0  # Bonus
+        else:  # Long function
+            reward += 0.5  # Smaller bonus (avoid rewarding verbosity)
+
+        # 2. COMPLEXITY BONUS
+        # Reward actual conditional logic (not just keywords in strings)
+        has_if = "if " in function and ":" in function.split("if ", 1)[-1][:50]
+        has_for = "for " in function and " in " in function
+        has_while = "while " in function and "True" not in function  # Exclude infinite loops
+
+        complexity_count = sum([has_if, has_for, has_while])
+        if complexity_count >= 2:
+            reward += 2.0  # Multiple control structures
+        elif complexity_count == 1:
+            reward += 1.0  # At least one control structure
+
+        # 3. DIVERSITY BONUS
+        # Reward strategies that can return different moves
+        moves_present = sum([
+            '"W"' in function or "'W'" in function,
+            '"A"' in function or "'A'" in function,
+            '"S"' in function or "'S'" in function,
+            '"D"' in function or "'D'" in function,
+        ])
+        if moves_present >= 3:
+            reward += 2.0  # Uses 3-4 different directions
+        elif moves_present >= 2:
+            reward += 1.0  # Uses 2 different directions
+        elif moves_present == 1:
+            reward -= 1.0  # Only one direction - likely trivial
+
+        scores.append(reward)
 
     return scores
 
@@ -551,16 +640,16 @@ def train_model(model, tokenizer, dataset, max_seq_length):
     max_completion_length = min(512, max_seq_length - max_prompt_length)
 
     training_args = GRPOConfig(
-        temperature=1.0,
-        learning_rate=5e-5,
+        temperature=1.1,  # Higher temp for exploration (was 1.0)
+        learning_rate=2e-5,  # Lower LR to prevent collapse (was 5e-5)
         weight_decay=0.001,
         warmup_ratio=0.1,
         lr_scheduler_type="linear",
         optim="adamw_8bit",
         logging_steps=1,
-        per_device_train_batch_size=8,  # Reduced for faster iteration
-        gradient_accumulation_steps=1,  # More frequent updates
-        num_generations=2,  # Minimum for GRPO (reduces evaluation time)
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=1,
+        num_generations=4,  # More generations for variance (was 2)
         max_prompt_length=max_prompt_length,
         max_completion_length=max_completion_length,
         # num_train_epochs=1,  # Set to 1 for a full training run
@@ -577,6 +666,7 @@ def train_model(model, tokenizer, dataset, max_seq_length):
             function_works,
             no_cheating,
             strategy_succeeds,
+            complexity_reward,  # Prevents collapse to trivial strategies
         ],
         args=training_args,
         train_dataset=dataset,
