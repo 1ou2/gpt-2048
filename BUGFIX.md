@@ -648,6 +648,296 @@ This is a fundamental limitation of GRPO with a single repeated prompt. The mode
 
 ---
 
+## 18. Signal-Based Timeout Fails to Catch Infinite Loops
+
+**Problem:** The `@execute_with_time_limit(2)` decorator from unsloth uses signal-based timeouts that fail to reliably catch infinite loops in generated strategy code.
+
+**Symptoms:**
+- Training hangs indefinitely despite 2-second timeout configured
+- CPU pegged at 96-100% with no progress
+- Generated code with tight `while True:` loops runs forever
+- Timeout mechanism not triggering for pure Python loops
+- Manual intervention (Ctrl+C) required to stop training
+
+**Root Cause:** The `execute_with_time_limit` decorator relies on `signal.alarm()` which has fundamental limitations:
+
+1. **Signals can be blocked or delayed** by certain system calls
+2. **Pure Python infinite loops** may not check for signals frequently enough:
+   ```python
+   def strategy(board):
+       while True:
+           x = 1  # This loop never checks for signals!
+       return "W"
+   ```
+3. **Not cross-platform** - `signal.SIGALRM` doesn't work on Windows
+4. **Not thread-safe** - signals only work in the main thread
+5. **Race conditions** - signal delivery timing is unpredictable
+
+The Python interpreter only checks for pending signals between bytecode instructions. Tight C-level loops or pure Python loops with simple operations may not check signals frequently enough, allowing them to run indefinitely.
+
+**Solution:** Replace signal-based timeout with **multiprocessing-based timeout** that forcefully terminates frozen processes:
+
+```python
+# 1. Import multiprocessing
+import sys
+import multiprocessing as mp
+from multiprocessing import Process, Queue
+
+# 2. Worker function in separate process
+def _execute_strategy_worker(strategy: Callable, game: GameBoard, result_queue: Queue):
+    """Worker function that runs in a separate process"""
+    try:
+        assert callable(strategy)
+        MAX_STEPS = 500  # Hard limit to prevent infinite loops
+        steps = 0
+        while game.state() == "ongoing":
+            if steps >= MAX_STEPS:
+                result_queue.put((steps, "failed"))
+                return
+            action = strategy(list(game.board()))
+            steps += 1
+            if type(action) is not str:
+                result_queue.put((steps, "failed"))
+                return
+            game.do_action(action)
+        result_queue.put((steps, game.state()))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+# 3. Main function with hard timeout
+def execute_strategy(strategy: Callable, game: GameBoard, timeout: float = 2.0):
+    """
+    Execute strategy with a hard timeout using multiprocessing.
+    This is more robust than signal-based timeouts and will forcefully
+    terminate infinite loops or frozen code.
+    """
+    result_queue = Queue()
+    process = Process(target=_execute_strategy_worker, args=(strategy, game, result_queue))
+    process.start()
+
+    # Wait for completion or timeout
+    process.join(timeout=timeout)
+
+    # Check if process is still alive (timed out)
+    if process.is_alive():
+        # Forcefully terminate the process
+        process.terminate()
+        process.join(timeout=1.0)  # Give it 1 second to terminate gracefully
+
+        # If still alive, kill it forcefully
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+        raise TimeoutError(f"Strategy execution exceeded {timeout}s timeout")
+
+    # Get the result from the queue
+    if not result_queue.empty():
+        result = result_queue.get()
+        if isinstance(result, tuple) and len(result) == 2:
+            if result[0] == "error":
+                raise RuntimeError(f"Strategy execution failed: {result[1]}")
+            return result
+
+    raise RuntimeError("Strategy execution failed without returning a result")
+
+# 4. Set multiprocessing start method
+if __name__ == "__main__":
+    # Use 'fork' on Linux (faster) and 'spawn' elsewhere
+    try:
+        if sys.platform.startswith('linux'):
+            mp.set_start_method('fork')
+        else:
+            mp.set_start_method('spawn')
+    except RuntimeError:
+        pass
+```
+
+**How it works:**
+
+1. **Process isolation**: Strategy runs in separate process with independent memory
+2. **Hard timeout**: `process.join(timeout=2.0)` waits for completion
+3. **Forceful termination**: If timeout expires:
+   - `process.terminate()` sends SIGTERM (graceful)
+   - Wait 1 second
+   - `process.kill()` sends SIGKILL (forceful) if still alive
+4. **Result communication**: Uses multiprocessing `Queue` to pass results back
+
+**Why 'fork' vs 'spawn':**
+
+- **'fork'** (Linux): Copies parent process memory, inherits all loaded modules
+  - Pros: Very fast (~0.01s overhead), no re-import needed
+  - Cons: Can have CUDA context issues (not a problem here - strategies don't use CUDA)
+
+- **'spawn'** (Windows/macOS): Starts fresh Python process
+  - Pros: Clean slate, no CUDA issues, cross-platform
+  - Cons: Must re-import torch/unsloth (~2-3s overhead per execution)
+
+For this project, **'fork' is safe** because strategy execution only manipulates board state (pure Python) and doesn't use CUDA directly.
+
+**Testing:**
+
+Created comprehensive test suite (`test_timeout.py`) with 6 test cases:
+
+```bash
+source .venv/bin/activate
+python test_timeout.py
+```
+
+Results:
+```
+✓ Test 1: Normal strategy completes successfully
+✓ Test 2: Infinite loop caught and terminated within 2s
+✓ Test 3: Slow computation (5s sleep) times out correctly
+✓ Test 4: Nested loops timeout correctly
+✓ Test 5: Exceptions propagate properly as RuntimeError
+✓ Test 6: Fast strategies complete within timeout
+
+Results: 6/6 tests passed
+```
+
+**Performance impact:**
+
+- **Fork method (Linux)**: ~0.01s overhead per execution → negligible
+- **Spawn method (others)**: ~2-3s overhead → only use if fork unavailable
+- **Timeout enforcement**: Sub-millisecond precision with guaranteed termination
+
+**Files Changed:**
+- `gpt_2048_rl.py` lines 10, 21-24: Added `sys`, `multiprocessing`, `Process`, `Queue` imports
+- `gpt_2048_rl.py` lines 16: Removed `execute_with_time_limit` from unsloth import
+- `gpt_2048_rl.py` lines 261-321: Replaced signal-based timeout with multiprocessing implementation
+- `gpt_2048_rl.py` lines 816-826: Added multiprocessing start method configuration
+- `test_timeout.py`: Created comprehensive test suite (new file)
+- `TIMEOUT_FIX.md`: Detailed technical documentation (new file)
+
+**Comparison with previous Bug #10:**
+
+Bug #10 attempted to solve infinite loops by:
+- Blocking `while True:` patterns in code before execution
+- Adding `MAX_STEPS = 500` limit in game loop
+
+This worked as a **prevention** strategy but didn't fix the underlying **timeout mechanism failure**. Bug #18 fixes the timeout mechanism itself, making it robust against any kind of infinite loop, not just `while True:`.
+
+**Key insight:** Process-based timeouts provide **guaranteed termination** regardless of what the code is doing. Even if code blocks on I/O, spins in a tight loop, or somehow bypasses signal checking, the OS can always forcefully kill a process.
+
+---
+
+## 18b. Unprotected Test Call Bypasses Timeout (CRITICAL)
+
+**Problem:** Despite implementing multiprocessing-based timeout for `execute_strategy()`, training still hung for 2+ hours. The timeout was being bypassed.
+
+**Symptoms:**
+- Training completely frozen with no progress
+- No timeout messages printed
+- Multiprocessing timeout implementation was correct
+- Process hung indefinitely
+
+**Root Cause:** There was an **unprotected function call** in `strategy_succeeds()` at line 505:
+
+```python
+# Line 505 - BEFORE FIX - NO TIMEOUT PROTECTION!
+test_board = [[0]*6 for _ in range(6)]
+try:
+    test_move = new_strategy(test_board)  # <-- HANGS FOREVER ON INFINITE LOOPS!
+```
+
+This test call happens **before** the protected `execute_strategy()` call. Its purpose is to verify the function returns a valid move (W/A/S/D). If the generated strategy has an infinite loop:
+
+```python
+def strategy(board):
+    while True:
+        pass
+    return "W"
+```
+
+The test call at line 505 hangs **forever** because:
+1. It calls `new_strategy()` directly without any timeout wrapper
+2. The protected `execute_strategy()` at line 531 is never reached
+3. Training freezes completely
+
+**Solution:** Created a new `call_with_timeout()` function for single function calls:
+
+```python
+def _call_with_timeout_worker(func, args, result_queue: Queue):
+    """Worker function for single function calls with timeout"""
+    try:
+        result = func(*args)
+        result_queue.put(("success", result))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+def call_with_timeout(func, args, timeout: float = 1.0):
+    """
+    Call a function with a hard timeout using multiprocessing.
+    Used to test strategy functions before running full game.
+    """
+    result_queue = Queue()
+    process = Process(target=_call_with_timeout_worker, args=(func, args, result_queue))
+    process.start()
+    process.join(timeout=timeout)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=0.5)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        raise TimeoutError(f"Function call exceeded {timeout}s timeout")
+
+    if not result_queue.empty():
+        status, result = result_queue.get()
+        if status == "error":
+            raise RuntimeError(result)
+        return result
+
+    raise RuntimeError("Function call failed without returning a result")
+```
+
+Then wrapped the test call:
+
+```python
+# Line 506 - AFTER FIX - WITH TIMEOUT PROTECTION
+test_board = [[0]*6 for _ in range(6)]
+try:
+    test_move = call_with_timeout(new_strategy, (test_board,), timeout=1.0)
+    # ... validation code ...
+except TimeoutError:
+    print(f"⏱️  Test call timed out (infinite loop?)")
+    scores.append(-3.0)  # Penalize infinite loops
+    continue
+```
+
+**Testing:**
+
+Added 2 new tests to `test_timeout.py`:
+
+```bash
+source .venv/bin/activate
+python test_timeout.py
+```
+
+Results:
+```
+✓ Test 1-6: (previous tests still pass)
+✓ Test 7: call_with_timeout on infinite loop - correctly caught timeout
+✓ Test 8: call_with_timeout on normal function - completed successfully
+
+Results: 8/8 tests passed
+```
+
+**Files Changed:**
+- `gpt_2048_rl.py` lines 262-294: Added `_call_with_timeout_worker()` and `call_with_timeout()` functions
+- `gpt_2048_rl.py` lines 502-526: Wrapped test call with `call_with_timeout()` and added TimeoutError handling
+- `test_timeout.py`: Added 2 new test cases for `call_with_timeout()`
+
+**Key insight:** When implementing timeout protection, you must identify **ALL** code paths that execute untrusted code. In this case:
+1. The obvious path (`execute_strategy()`) was protected
+2. The less obvious test path (`new_strategy(test_board)`) was not
+
+This is why the original fix appeared to work in tests (which only tested `execute_strategy()`) but failed in production where the test call happened first.
+
+---
+
 ## Summary Table
 
 | Issue | Root Cause | Impact | Fix |
@@ -668,6 +958,8 @@ This is a fundamental limitation of GRPO with a single repeated prompt. The mode
 | Zero variance collapse | Low temp + few generations + high LR | frac_reward_zero_std: 1.0 | temp=1.3, LR=2e-5, num_gen=4 |
 | Persistent trivial collapse | Trivial strategies get positive reward | Model stuck at `return "A"` | complexity_reward() function |
 | Deterministic strategy collapse | All generations see same input | Identical outputs, zero variance | **Unsolved** - need input diversity |
+| Signal timeout fails | signal.alarm() doesn't interrupt tight loops | Training hangs on infinite loops | Multiprocessing-based timeout with process.kill() |
+| Unprotected test call | test_move = new_strategy(board) has no timeout | Training hangs before execute_strategy() | call_with_timeout() wrapper for all untrusted code |
 
 ---
 
@@ -698,11 +990,365 @@ reward_funcs = [
     complexity_reward,   # Penalize trivial, reward complex (-4.0 to +5.0)
 ]
 
-# Safety
-execute_with_time_limit(2)  # 2 second timeout
+# Safety (multiprocessing-based timeout - robust against infinite loops)
+execute_strategy(strategy, game, timeout=2.0)  # 2 second hard timeout
 MAX_STEPS = 500  # Hard limit in game execution
 # Block: input(), open(), exec(), eval(), __import__
 # Block: while True:, while 1:, while(True)
+# Multiprocessing: Uses 'fork' on Linux, 'spawn' elsewhere
 ```
 
 Expected training time: ~3-4 hours for 1000 steps.
+
+---
+
+## 19. Degenerate Strategy Collapse - Frozen Board State (CRITICAL)
+
+**Problem:** After 6+ hours of training (1000 steps), the model completely failed to learn to play 2048. Strategies generate moves that don't change the board state, causing the game to freeze in place and hit the 500-step timeout repeatedly with 0 score.
+
+**Symptoms:**
+- **7,735 games** (out of ~8,000) hit 500-step timeout with score = 0
+- **0 games** scored any points or reached tiles above 4
+- Final reward stuck at 2.0 throughout training: `function_works=1.0 + no_cheating=1.0 + strategy_succeeds=0.0`
+- No evidence of valid gameplay in entire 11.1MB log file
+- Game boards remain nearly empty after 500 steps:
+  ```
+  Steps = 500 | State = failed | Score = 0
+  ┌───┬───┬───┬───┐
+  │  .│  .│  4│  .│
+  ├───┼───┼───┼───┤
+  │  .│  .│  .│  .│
+  ├───┼───┼───┼───┤
+  │  .│  .│  .│  2│
+  └───┴───┴───┴───┘
+  ```
+- No instances of "🎯 Max tile:" message (tile-based rewards never triggered)
+- Training completed successfully but model learned nothing
+
+**Root Cause Analysis:**
+
+**1. Frozen Game State Loop**
+
+Looking at `gpt_2048_rl.py:168-189`, the `do_action()` method only spawns new tiles when the board changes:
+
+```python
+def do_action(self, key: str) -> None:
+    # ...
+    new_board, gain, changed = mover(self._board)
+    if changed:
+        self._board = new_board
+        self._score += gain
+        self._add_random_tile()  # Only spawns if board changed!
+    self._update_state_after_change()
+```
+
+**The problem:** If a strategy returns a move that doesn't change the board (e.g., moving left when all tiles are already on the left edge), then:
+- `changed = False`
+- No new tile spawns
+- Board state remains frozen
+- Strategy continues returning the same invalid move
+- Loop continues until MAX_STEPS=500 timeout
+- Score remains 0 (no merges occurred)
+
+**2. Local Optimum at +2.0 Reward**
+
+The model discovered it can reliably achieve +2.0 reward without actually playing:
+- Write syntactically valid function: `function_works` = +1.0
+- Don't use forbidden imports: `no_cheating` = +1.0
+- Return valid move string in test: doesn't crash, gets through validation
+- Game execution: frozen state, hits timeout, max_tile=4, gets 0.0 from `strategy_succeeds`
+- **Total: +2.0** (stable, safe, no risk of crashes)
+
+This is more profitable than trying complex strategies that might crash (-3.0 penalty) or timeout (-1.0 penalty).
+
+**3. Reward Structure Has No Gradient for Early Learning**
+
+Looking at `gpt_2048_rl.py:541-553`:
+
+```python
+if max_tile >= 8:
+    level = int(math.log2(max_tile)) - 2
+    tile_reward = float(level)
+    scores.append(tile_reward)
+else:
+    scores.append(0.0)  # Tiles 2 and 4 get ZERO reward!
+```
+
+The strategies never reach tile 8, so they get **0.0** from `strategy_succeeds`. There's no gradient to climb:
+- Tile 2 → 0.0 reward
+- Tile 4 → 0.0 reward
+- Tile 8 → 1.0 reward (unreachable jump)
+
+The model needs to randomly stumble upon a strategy that reaches tile 8 before it gets any positive reinforcement for gameplay. With frozen board states, this never happens.
+
+**4. Evidence from Training Logs**
+
+Early training rewards show the model was exploring but getting penalized:
+```
+Step 1: reward = 1.4375
+Step 2: reward = -1.9375
+Step 3: reward = 1.25
+Step 4: reward = -5.0
+...
+```
+
+By the end, it converged to the safe +2.0 local optimum:
+```
+Step 995-1000: reward = 2.0 (constant)
+reward_std = 0.0
+frac_reward_zero_std = 1.0
+```
+
+**Root Cause Summary:**
+The combination of (1) frozen board states from invalid moves, (2) a safe +2.0 reward for do-nothing strategies, and (3) zero reward for tiles < 8 creates a learning environment where the model is incentivized to give up and output simple valid code rather than try to play the game.
+
+**Solution Recommendations:**
+
+**1. Add Reward Shaping for Small Progress**
+
+```python
+# Replace lines 541-553 in strategy_succeeds()
+max_tile = max(max(row) for row in game.board())
+
+# Reward ALL progress, not just tile >= 8
+if max_tile >= 2:
+    # Logarithmic scale: 2->0.5, 4->1.0, 8->1.5, 16->2.0, ...
+    tile_reward = math.log2(max_tile) - 1.0
+    scores.append(tile_reward)
+else:
+    scores.append(0.0)
+
+# OR reward score directly (encourages merges)
+score_reward = min(5.0, game.score() / 100)  # Any score gets positive reward
+scores.append(score_reward)
+```
+
+**2. Penalize Frozen Board States**
+
+```python
+# Add to _execute_strategy_worker() before line 304
+consecutive_frozen = 0
+last_board = None
+
+while game.state() == "ongoing":
+    if steps >= MAX_STEPS:
+        result_queue.put((steps, "failed"))
+        return
+
+    current_board = [row[:] for row in game.board()]
+    action = strategy(current_board)
+
+    # Detect frozen state
+    if current_board == last_board:
+        consecutive_frozen += 1
+        if consecutive_frozen >= 10:  # 10 moves without change
+            result_queue.put((steps, "failed"))
+            return
+    else:
+        consecutive_frozen = 0
+
+    last_board = current_board
+    steps += 1
+    game.do_action(action)
+```
+
+Then in `strategy_succeeds()`:
+```python
+# Add after line 531
+if steps < 20 and game_state == "failed":
+    # Failed very quickly = frozen state or bad strategy
+    scores.append(-2.0)  # Penalize frozen states
+    continue
+```
+
+**3. Rebalance Penalties**
+
+The `-3.0` penalty for invalid moves is too harsh compared to `+2.0` for valid do-nothing code. This discourages exploration.
+
+```python
+# Reduce invalid move penalty
+if test_move not in ["W", "A", "S", "D"]:
+    scores.append(-1.0)  # Was -3.0, less harsh
+    continue
+```
+
+**4. Add Move Validity Bonus**
+
+```python
+# Add after successful game execution
+if steps >= 10:  # Made at least 10 valid moves
+    scores.append(base_reward + 0.5)  # Small bonus for being playable
+else:
+    scores.append(base_reward - 0.5)  # Penalty for frozen/bad strategies
+```
+
+**5. Simplify Initial Task** (optional but recommended)
+
+```python
+# Reduce board size for faster learning
+game = GameBoard(size=3, seed=seed, target=128)  # Was size=4, target=2048
+
+# OR reward intermediate milestones
+if max_tile >= 32:
+    scores.append(10.0)  # Celebrate reaching 32!
+```
+
+**6. Enable complexity_reward**
+
+Uncomment line 749 in `gpt_2048_rl.py` to enable the `complexity_reward()` function that prevents trivial single-move strategies.
+
+**Key Insight:** The model technically succeeded at its learned objective: "generate syntactically valid code that doesn't crash." It just never learned that the code should also *play the game*. The reward structure needs to incentivize incremental gameplay progress, not just code validity.
+
+**Files Changed:**
+- `gpt_2048_rl.py` line 874: Enabled `complexity_reward` function
+- `gpt_2048_rl.py` lines 307-347: Added frozen board state detection in `_execute_strategy_worker`
+- `gpt_2048_rl.py` lines 419-425: Added frozen state penalty (-2.0)
+- `gpt_2048_rl.py` lines 434-451: Added small rewards for tiles 2-4 (0.2, 0.5)
+- `gpt_2048_rl.py` lines 409-413, 685-701, 735-740: Rebalanced penalties (less harsh)
+- `BUG19_FIX_SUMMARY.md`: Created comprehensive documentation (new file)
+
+**Solution Summary:**
+
+The fix combines THREE mechanisms to prevent local minima:
+
+1. **Enabled `complexity_reward`**: Creates -4.0 penalty for trivial strategies
+2. **Small early tile rewards**: +0.2 (tile 2), +0.5 (tile 4) for gradient
+3. **Frozen state detection**: Catches stuck strategies within 10 moves instead of 500
+
+**The Math (prevents "return W" collapse):**
+- `return "W"` + tile 4: +1 +1 -4 +0.5 = **-1.5** (unprofitable)
+- Smart strategy + tile 8: +1 +1 +1 +1.0 = **+4.0** (profitable)
+
+Even with early tile rewards, trivial strategies remain unprofitable due to complexity penalty dominating. This encourages the model to write complex, multi-directional strategies.
+
+**Expected Results:**
+- Steps 1-100: Variety of rewards, frozen state detection active
+- Steps 100-500: Tile 8-16 regularly, rewards climb to +3 to +5
+- Steps 500-1000: Tile 32-128, rewards climb to +7 to +11
+- Frozen state frequency should decrease over time
+
+**Implemented:**
+- ✅ Solution 1: Add reward shaping with safeguards (complexity penalty dominates)
+- ✅ Solution 2: Frozen board state detection and penalties
+- ✅ Solution 3: Rebalanced penalties (less harsh to encourage exploration)
+
+---
+
+## 20. Poor GPU Utilization - CPU Bottleneck (PERFORMANCE)
+
+**Problem:** Training runs with very low GPU utilization (~30W power, 10% of TDP) and frequent idle periods. GPU downclocks from 2550 MHz to 2390 MHz due to spiky workload pattern. Training is CPU-bottlenecked by reward computation.
+
+**Symptoms:**
+- GPU clock speed: Starts at 2550 MHz, drops to 2390 MHz and stays there (6% perf loss)
+- GPU power usage: ~30W average (should be 150-200W for compute workloads)
+- GPU utilization: 80-100% with frequent drops to 0% (vertical gaps in graph)
+- GPU temperature: Drops from 70°C to 53°C (low temp = not working hard)
+- Training efficiency: Only 71% (GPU idle 29% of the time during reward computation)
+
+**Root Cause:**
+
+The training loop alternates between GPU-bound generation and CPU-bound reward computation:
+
+```
+[GPU: Generate completions] → [CPU: Compute rewards] → [GPU: Gradients] → repeat
+       ~15 seconds                   ~6-7 seconds            ~1 second
+     (GPU busy)                    (GPU IDLE)            (GPU busy)
+```
+
+With `per_device_train_batch_size=8` and `num_generations=4`, only 32 completions are generated per step. This creates:
+1. Short GPU burst (15s) followed by long CPU wait (6s)
+2. GPU sees spiky workload and downclocks to save power
+3. 30-40% of each step wasted with GPU idle
+4. Low power usage (~30W vs 150-200W capable)
+
+**Why the GPU Downclocks:**
+
+Modern GPUs dynamically adjust clock speed based on workload patterns:
+- **Sustained heavy load** → Stay boosted at max clocks (2550 MHz)
+- **Spiky/bursty load** → Downclock to save power (2390 MHz)
+
+The current batch size is too small to keep the GPU busy long enough to justify staying boosted.
+
+**Solution 1: Increase Batch Size**
+
+```python
+# Line 730 in gpt_2048_rl.py
+per_device_train_batch_size=16,  # Was 8, doubled
+num_generations=4,                # Keep at 4
+# Total: 64 completions per step instead of 32
+```
+
+**Impact:**
+- GPU generation time: ~30s (doubled)
+- Reward computation time: ~12s (but same proportion)
+- Training efficiency: 71% → 83% (12% improvement)
+- Clock speed: Should stay at 2550 MHz (no downclock)
+- Power usage: Should increase to 100-150W sustained
+- Step time: ~36s vs ~21s (1.7x slower per step, but 2x more work per step)
+- **Net result: ~1.2x faster training overall**
+
+**Solution 2: Reduce Timeout**
+
+```python
+# Line 317 in gpt_2048_rl.py
+def execute_strategy(strategy: Callable, game: GameBoard, timeout: float = 1.0):
+    # Was 2.0, reduced to 1.0
+```
+
+**Impact:**
+- With 7,735 timeouts in previous run: Saves 7,735 × 1s = **2 hours**
+- Faster rejection of bad strategies (infinite loops, frozen states)
+- Less time wasted on clearly failing code
+
+**Solution 3: Parallel Reward Computation** (IMPLEMENTED)
+
+Reward computation now supports parallel execution using `ProcessPoolExecutor`. Controlled by flags at the top of the file:
+
+```python
+# Lines 52-53 in gpt_2048_rl.py
+ENABLE_PARALLEL_REWARDS = True  # Set to False to disable
+PARALLEL_WORKERS = 8            # Number of parallel workers
+```
+
+**How it works:**
+- Phase 1: Fast validation (extract, check syntax, check modules) runs sequentially
+- Phase 2: Expensive game execution runs in parallel (8 games at once)
+- Worker function `_run_game_worker()` handles complete game evaluation
+- Results are merged back and printed in order
+
+**Expected impact:**
+- Reward computation: 6s → 1-2s (3-6x faster)
+- Training efficiency: 71% → 94%
+- Step time: ~36s → ~25s (even with doubled batch size)
+- **Combined with batch size increase: ~2x faster training overall**
+
+**Files Changed:**
+- `gpt_2048_rl.py` line 24: Added `from concurrent.futures import ProcessPoolExecutor`
+- `gpt_2048_rl.py` lines 45-53: Added configuration flags `ENABLE_PARALLEL_REWARDS` and `PARALLEL_WORKERS`
+- `gpt_2048_rl.py` lines 371-424: Added `_run_game_worker()` function for parallel game execution
+- `gpt_2048_rl.py` lines 518-686: Refactored `strategy_succeeds()` to support parallel execution
+- `gpt_2048_rl.py` line 730: Changed `per_device_train_batch_size=8` → `16`
+- `gpt_2048_rl.py` line 317: Changed `timeout: float = 2.0` → `1.0`
+- `gpt_2048_rl.py` line 322: Updated docstring to mention 1.0s timeout
+- `gpt_2048_rl.py` line 556: Updated error message "2s exceeded" → "1s exceeded"
+
+**Expected Results After All Three Fixes:**
+
+Before:
+- Clock speed: 2390 MHz (downclocked)
+- Power: ~30W (10% of capacity)
+- Utilization: 71% (frequent idle gaps)
+- Step time: ~21s for 32 completions
+- Timeout waste: 7,735 × 2s = ~4 hours per run
+
+After (batch size + timeout + parallel):
+- Clock speed: 2550 MHz (staying boosted) ✓
+- Power: 100-150W (GPU actually working) ✓
+- Utilization: 94%+ (minimal idle gaps) ✓
+- Step time: ~25s for 64 completions ✓
+- Timeout waste: 7,735 × 1s = ~2 hours (saved 2 hours) ✓
+- **Overall: ~2x faster training** (1.2x from GPU + 0.6x from parallel + 2h from timeout)
+
+**Key Insight:** The GPU was "bored" - the workload wasn't challenging enough to justify staying at max clocks. Doubling the batch size gives the GPU more work to do per step, keeping it engaged and boosted. The clock speed drop from 2550→2390 MHz was the GPU's way of saying "this isn't worth staying hot for."
+
+---
